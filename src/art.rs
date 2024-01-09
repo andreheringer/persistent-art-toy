@@ -1,6 +1,6 @@
 use std::mem::size_of;
 
-use crate::offsets::PageOffset;
+use crate::offsets::{PageOffset};
  
 const TAG_NONE: usize = 0b000;
 const TAG_VALUE: usize = 0b001;
@@ -11,6 +11,9 @@ const TAG_48: usize = 0b101;
 const TAG_256: usize = 0b110;
 const TAG_MASK: usize = 0b111;
 const PTR_MASK: usize = usize::MAX - TAG_MASK;
+
+
+const MAX_PATH_COMPRESSION_BYTES: usize = 9;
 
 #[derive(Clone)]
 pub struct Art {
@@ -42,12 +45,41 @@ impl Art {
     pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    fn slot_for_key(
+        &self,
+        key: &[u8],
+        is_add: bool
+    ) -> Option<(Option<&mut u16>,Option<&mut NodePtr>)> {
+        let mut parent_num_children: Option<&mut u16> = None;
+        let mut path: &[u8] = &key[..];
+        let mut cursor: &mut NodePtr = &mut self.root;
+
+        println!("cursor is {:?}", cursor);
+        while !path.is_empty() {
+            if cursor.is_none() {
+                if !is_add {
+                    return None;
+                }
+                *cursor = NodePtr::node1(Box::default());
+                if let Some(children) = parent_num_children {
+                    *children = children.checked_add(1).unwrap(); 
+                }
+                let prefix_len = (path.len() - 1).min(MAX_PATH_COMPRESSION_BYTES);
+                let prefix = &path[..path_len];
+
+            } 
+        }
+
+    }
+
+    
 }
 
 
 enum NodeRef<'a> {
     None,
-    Value(&'a PageOffset),
+    Value(&'a TwigNode),
     Node1(&'a Node1),
     Node4(&'a Node4),
     Node16(&'a Node16),
@@ -57,7 +89,7 @@ enum NodeRef<'a> {
 
 enum NodeMut<'a> {
     None,
-    Value(&'a mut PageOffset),
+    Value(&'a mut TwigNode),
     Node1(&'a mut Node1),
     Node4(&'a mut Node4),
     Node16(&'a mut Node16),
@@ -65,6 +97,7 @@ enum NodeMut<'a> {
     Node256(&'a mut Node256),
 }
 
+#[derive(Debug)]
 struct NodePtr(usize);
 
 impl NodePtr {
@@ -107,11 +140,11 @@ impl NodePtr {
         NodePtr(us | TAG_256)
     }
 
-    fn value(offset: PageOffset) -> NodePtr {
-        let bx = Box::new(offset);
-        let ptr: *mut PageOffset = Box::into_raw(bx);
+    fn value(twig: TwigNode) -> NodePtr {
+        let bx = Box::new(twig);
+        let ptr: *mut TwigNode = Box::into_raw(bx);
         let us = ptr as usize;
-        if size_of::<PageOffset>() > 0 {
+        if size_of::<TwigNode>() > 0 {
             assert_eq!(us & TAG_VALUE, 0);
         } else {
             assert_eq!(ptr, std::ptr::NonNull::dangling().as_ptr());
@@ -123,12 +156,12 @@ impl NodePtr {
         match self.0 & TAG_MASK {
             TAG_NONE => NodeRef::None,
             TAG_VALUE => {
-                let ptr: *const PageOffset = if size_of::<PageOffset>() > 0 {
-                    (self.0 & PTR_MASK) as *const PageOffset
+                let ptr: *const TwigNode = if size_of::<TwigNode>() > 0 {
+                    (self.0 & PTR_MASK) as *const TwigNode
                 } else {
                     std::ptr::NonNull::dangling().as_ptr()
                 };
-                let reference: &PageOffset = unsafe { &(*ptr) };
+                let reference: &TwigNode = unsafe { &(*ptr) };
                 NodeRef::Value(reference)
             }
             TAG_1 => {
@@ -164,12 +197,12 @@ impl NodePtr {
         match self.0 & TAG_MASK {
             TAG_NONE => NodeMut::None,
             TAG_VALUE => {
-                let ptr: *mut PageOffset = if size_of::<PageOffset>() > 0 {
-                    (self.0 & PTR_MASK) as *mut PageOffset 
+                let ptr: *mut TwigNode = if size_of::<TwigNode>() > 0 {
+                    (self.0 & PTR_MASK) as *mut TwigNode 
                 } else {
                     std::ptr::NonNull::dangling().as_ptr()
                 };
-                let reference: &mut PageOffset = unsafe { &mut (*ptr) };
+                let reference: &mut TwigNode = unsafe { &mut (*ptr) };
                 NodeMut::Value(reference)
             }
             TAG_1 => {
@@ -205,24 +238,48 @@ impl NodePtr {
         self.0 == TAG_NONE
     }
 
-    fn take(&mut self) -> Option<PageOffset> {
+    fn take(&mut self) -> Option<TwigNode> {
         let us = self.0;
         self.0 = 0;
 
         match us & TAG_MASK {
             TAG_NONE => None,
             TAG_VALUE => {
-                let ptr: *mut PageOffset = if size_of::<PageOffset>() > 0 {
-                    (us & PTR_MASK) as *mut PageOffset 
+                let ptr: *mut TwigNode = if size_of::<TwigNode>() > 0 {
+                    (us & PTR_MASK) as *mut TwigNode 
                 } else {
                     std::ptr::NonNull::dangling().as_ptr()
                 };
-                let boxed: Box<PageOffset> = unsafe { Box::from_raw(ptr) };
+                let boxed: Box<TwigNode> = unsafe { Box::from_raw(ptr) };
                 Some(*boxed)
             }
             _ => unreachable!(),
         }
     }
+
+    fn header_mut(&mut self) -> &mut NodeHeader {
+        match self.deref_mut() {
+            NodeMut::Node1(n1) => &mut n1.header,
+            NodeMut::Node4(n4) => &mut n4.header,
+            NodeMut::Node16(n16) => &mut n16.header,
+            NodeMut::Node48(n48) => &mut n48.header,
+            NodeMut::Node256(n256) => &mut n256.header,
+            _ => unreachable!(),
+        }
+    }
+
+    fn child(&self, byte: u8) -> Option<&NodePtr> {
+        match self.deref() {
+            NodeRef::Node1(n1) => n1.child(byte),
+            NodeRef::Node4(n4) => n4.child(byte),
+            NodeRef::Node16(n16) => n16.child(byte),
+            NodeRef::Node48(n48) => n48.child(byte),
+            NodeRef::Node256(n256) => n256.child(byte),
+            NodeRef::None => None,
+            NodeRef::Value(_) => unreachable!(),
+        }
+    }
+
 
 }
 
@@ -232,8 +289,8 @@ impl Drop for NodePtr {
         match self.0 & TAG_MASK {
             TAG_NONE => {}
             TAG_VALUE => {
-                let ptr: *mut PageOffset = if size_of::<PageOffset>() > 0 {
-                        (self.0 & PTR_MASK) as *mut PageOffset 
+                let ptr: *mut TwigNode = if size_of::<TwigNode>() > 0 {
+                        (self.0 & PTR_MASK) as *mut TwigNode 
                     } else {
                         std::ptr::NonNull::dangling().as_ptr()
                     };
@@ -288,6 +345,7 @@ impl Clone for NodePtr {
 struct NodeHeader {
     prefix: Vec<u8>,
     children: u16,
+    ts: u64,
 }
 
 #[derive(Clone)]
@@ -322,4 +380,11 @@ struct Node48 {
 struct Node256 {
     header: NodeHeader,
     slots: [NodePtr; 256]
+}
+
+#[repr(align(8))]
+#[derive(Clone)]
+struct TwigNode {
+    ts: u64,
+    slots: Vec<PageOffset>,
 }
