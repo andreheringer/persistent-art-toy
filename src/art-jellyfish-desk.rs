@@ -1,6 +1,6 @@
-use crate::offsets::PageOffset;
 use std::mem::size_of;
-use std::ops::{Bound, RangeBounds};
+
+use crate::offsets::PageOffset;
 
 const TAG_NONE: usize = 0b000;
 const TAG_VALUE: usize = 0b001;
@@ -13,14 +13,6 @@ const TAG_MASK: usize = 0b111;
 const PTR_MASK: usize = usize::MAX - TAG_MASK;
 
 const MAX_PATH_COMPRESSION_BYTES: usize = 9;
-
-fn map_bound<T, U, F: FnOnce(T) -> U>(bound: Bound<T>, f: F) -> Bound<U> {
-    match bound {
-        Bound::Unbounded => Bound::Unbounded,
-        Bound::Included(x) => Bound::Included(f(x)),
-        Bound::Excluded(x) => Bound::Excluded(f(x)),
-    }
-}
 
 const NONE_HEADER: NodeHeader = NodeHeader {
     children: 0,
@@ -232,11 +224,6 @@ enum NodeMut<'a> {
 
 #[derive(Debug)]
 struct NodePtr(usize);
-
-struct NodeIter<'a> {
-    node: &'a NodePtr,
-    children: Box<dyn 'a + DoubleEndedIterator<Item = (Option<u8>, &'a NodePtr)>>,
-}
 
 impl NodePtr {
     const fn none() -> NodePtr {
@@ -625,26 +612,6 @@ impl NodePtr {
             NodeMut::Value(_) => unreachable!(),
         })
     }
-
-    fn node_iter<'a>(&'a self) -> NodeIter<'a> {
-        let children: Box<dyn 'a + DoubleEndedIterator<Item = (Option<u8>, &'a NodePtr)>> =
-            match self.deref() {
-                NodeRef::Node1(n1) => Box::new(n1.iter()),
-                NodeRef::Node4(n4) => Box::new(n4.iter()),
-                NodeRef::Node16(n16) => Box::new(n16.iter()),
-                NodeRef::Node48(n48) => Box::new(n48.iter()),
-                NodeRef::Node256(n256) => Box::new(n256.iter()),
-
-                // this is only an iterator over nodes, not leaf values
-                NodeRef::None => Box::new([].into_iter()),
-                NodeRef::Value(_) => Box::new([].into_iter()),
-            };
-
-        NodeIter {
-            node: self,
-            children,
-        }
-    }
 }
 
 impl Drop for NodePtr {
@@ -704,7 +671,7 @@ impl Clone for NodePtr {
     }
 }
 
-#[derive(Clone, Default, Copy, Debug, PartialEq)]
+#[derive(Clone, Default, Copy, PartialEq, Debug)]
 struct NodeHeader {
     path: [u8; MAX_PATH_COMPRESSION_BYTES],
     path_len: u8,
@@ -720,10 +687,6 @@ struct Node1 {
 }
 
 impl Node1 {
-    fn iter<'a>(&'a self) -> impl DoubleEndedIterator<Item = (Option<u8>, &NodePtr)> {
-        std::iter::once((Some(self.key), &self.slot))
-    }
-
     const fn child(&self, byte: u8) -> Option<&NodePtr> {
         if self.key == byte && !self.slot.is_none() {
             Some(&self.slot)
@@ -1035,6 +998,7 @@ impl Node48 {
     fn downgrade(&mut self) -> Box<Node16> {
         let mut n16: Box<Node16> = Box::default();
         let mut dst_idx = 0;
+
         for (byte, idx) in self.key_hashes.iter().enumerate() {
             if let Some(i) = idx {
                 assert!(!self.slots[*i as usize].is_none());
@@ -1066,12 +1030,12 @@ impl Default for Node256 {
 }
 
 impl Node256 {
-    fn iter<'a>(&'a self) -> impl DoubleEndedIterator<Item = (Option<u8>, &NodePtr)> {
+    fn iter<'a>(&'a self) -> impl DoubleEndedIterator<Item = (u8, &NodePtr)> {
         self.slots
             .iter()
             .enumerate()
             .filter(move |(_, slot)| !slot.is_none())
-            .map(|(c, slot)| (u8::try_from(c).ok(), slot))
+            .map(|(c, slot)| (u8::try_from(c).unwrap(), slot))
     }
 
     const fn child(&self, byte: u8) -> Option<&NodePtr> {
@@ -1106,7 +1070,7 @@ impl Node256 {
 }
 
 #[repr(align(8))]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 struct TwigNode {
     header: NodeHeader,
     doc: String,
@@ -1120,76 +1084,96 @@ impl TwigNode {
 
 #[cfg(test)]
 mod test {
-    use crate::art::NONE_HEADER;
-
     use super::{Art, NodeHeader, TwigNode};
 
     #[test]
     fn basic() {
         let mut art = Art::new();
-        art.insert(&[37], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[0], TwigNode::new(NONE_HEADER, String::from("Test2")));
+        art.insert(
+            &[30],
+            TwigNode::new(NodeHeader::default(), String::from("Test")),
+        );
+        art.insert(
+            &[0],
+            TwigNode::new(NodeHeader::default(), String::from("Test2")),
+        );
         assert_eq!(art.len(), 2);
 
-        art.insert(&[5], TwigNode::new(NONE_HEADER, String::from("Test5")));
-        art.insert(&[1], TwigNode::new(NONE_HEADER, String::from("Test1")));
-        art.insert(&[0], TwigNode::new(NONE_HEADER, String::from("Test0")));
-        art.insert(&[255], TwigNode::new(NONE_HEADER, String::from("Test255")));
-        art.insert(&[0], TwigNode::new(NONE_HEADER, String::from("Test0")));
-        art.insert(&[47], TwigNode::new(NONE_HEADER, String::from("Test47")));
-        art.insert(&[253], TwigNode::new(NONE_HEADER, String::from("Test253")));
+        art.insert(
+            &[5],
+            TwigNode::new(NodeHeader::default(), String::from("Test5")),
+        );
+        art.insert(
+            &[1],
+            TwigNode::new(NodeHeader::default(), String::from("Test1")),
+        );
+        art.insert(
+            &[0],
+            TwigNode::new(NodeHeader::default(), String::from("Test0")),
+        );
+        art.insert(
+            &[255],
+            TwigNode::new(NodeHeader::default(), String::from("Test255")),
+        );
+        art.insert(
+            &[0],
+            TwigNode::new(NodeHeader::default(), String::from("Test0")),
+        );
+        art.insert(
+            &[47],
+            TwigNode::new(NodeHeader::default(), String::from("Test47")),
+        );
+        art.insert(
+            &[253],
+            TwigNode::new(NodeHeader::default(), String::from("Test253")),
+        );
         assert_eq!(art.len(), 7);
 
-        art.insert(&[10], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[38], TwigNode::new(NONE_HEADER, String::from("Test2")));
-        art.insert(&[24], TwigNode::new(NONE_HEADER, String::from("Test72")));
+        art.insert(
+            &[10],
+            TwigNode::new(NodeHeader::default(), String::from("Test")),
+        );
+        art.insert(
+            &[38],
+            TwigNode::new(NodeHeader::default(), String::from("Test2")),
+        );
+        art.insert(
+            &[24],
+            TwigNode::new(NodeHeader::default(), String::from("Test72")),
+        );
         assert_eq!(art.len(), 10);
-        art.insert(&[28], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[30], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[28], TwigNode::new(NONE_HEADER, String::from("Test44")));
-        art.insert(&[51], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[53], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[59], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[58], TwigNode::new(NONE_HEADER, String::from("Test")));
-        assert_eq!(art.len(), 16);
-        /* art.insert([28], 30);
-        art.insert([30], 30);
-        art.insert([28], 15);
-        art.insert([51], 48);
-        art.insert([53], 255);
-        art.insert([59], 58);
-        art.insert([58], 58);
-        assert_eq!(art.len(), 16);
-        assert_eq!(art.remove(&[85]), None);
-        assert_eq!(art.len(), 16); */
     }
 
     #[test]
-    fn regression_04() {
-        let mut art = Art::new();
-
-        art.insert(&[], TwigNode::new(NONE_HEADER, String::from("Test")));
+    fn regression_01() {
+        let mut art: Art = Art::new();
 
         assert_eq!(
-            art.get(&[]),
-            Some(&TwigNode::new(NONE_HEADER, String::from("Test")))
+            art.insert(
+                &[0, 0, 0],
+                TwigNode::new(NodeHeader::default(), String::from("Test"))
+            ),
+            None
         );
         assert_eq!(
-            art.remove(&[]),
-            Some(TwigNode::new(NONE_HEADER, String::from("Test")))
+            art.insert(
+                &[0, 11, 0],
+                TwigNode::new(NodeHeader::default(), String::from("Test"))
+            ),
+            None
         );
-        assert_eq!(art.get(&[]), None);
-    }
+        assert_eq!(
+            art.insert(
+                &[0, 0, 0],
+                TwigNode::new(NodeHeader::default(), String::from("Test"))
+            ),
+            Some(TwigNode::new(NodeHeader::default(), String::from("Test")))
+        );
 
-    #[test]
-    fn regression_05() {
-        let mut art = Art::new();
-
-        let k = [0; 2];
-        //art.insert(k, 0);
-        //assert_eq!(art.remove(&k), Some(0));
-
-        assert!(art.root.is_none());
+        assert_eq!(
+            art.iter().collect::<Vec<_>>(),
+            vec![([0, 0, 0], &2), ([0, 11, 0], &1),]
+        );
     }
 }
 
