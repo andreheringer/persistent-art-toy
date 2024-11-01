@@ -1,6 +1,7 @@
-use crate::offsets::PageOffset;
-use std::mem::size_of;
-use std::ops::{Bound, RangeBounds};
+use std::{collections::{BTreeMap, HashMap}, f32::consts::E, mem::size_of, sync::atomic::AtomicU64};
+
+use derive_more::derive::From;
+use serde_json::{Number, Value};
 
 const TAG_NONE: usize = 0b000;
 const TAG_VALUE: usize = 0b001;
@@ -14,25 +15,53 @@ const PTR_MASK: usize = usize::MAX - TAG_MASK;
 
 const MAX_PATH_COMPRESSION_BYTES: usize = 9;
 
-fn map_bound<T, U, F: FnOnce(T) -> U>(bound: Bound<T>, f: F) -> Bound<U> {
-    match bound {
-        Bound::Unbounded => Bound::Unbounded,
-        Bound::Included(x) => Bound::Included(f(x)),
-        Bound::Excluded(x) => Bound::Excluded(f(x)),
-    }
-}
-
 const NONE_HEADER: NodeHeader = NodeHeader {
     children: 0,
     path_len: 0,
     path: [0; MAX_PATH_COMPRESSION_BYTES],
-    ts: 0,
+    version: 0,
 };
 
-#[derive(Clone)]
+#[derive(Debug, From)]
+pub enum Error {
+    ConflictingTwigTypes { origin: TwigKey, added: TwigKey },
+    IncompatibleVersion,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::ConflictingTwigTypes { origin, added } => write!(
+                f,
+                "New entry for TwigNode {:?} conflicts with previous type {:?}",
+                origin, added
+            ),
+            Error::IncompatibleVersion => write!(f, "Attempt to insert incompatible version"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+pub type Result<T> = core::result::Result<T, Error>;
+
 pub struct Art {
     len: usize,
     root: NodePtr,
+    version_counter: AtomicU64,
+}
+
+impl Clone for Art {
+    fn clone(&self) -> Self {
+        Self {
+            len: self.len.clone(),
+            root: self.root.clone(),
+            version_counter: AtomicU64::new(
+                self.version_counter
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+        }
+    }
 }
 
 impl Default for Art {
@@ -40,6 +69,7 @@ impl Default for Art {
         Art {
             len: 0,
             root: NodePtr::none(),
+            version_counter: AtomicU64::new(0)
         }
     }
 }
@@ -49,6 +79,7 @@ impl Art {
         Art {
             len: 0,
             root: NodePtr::none(),
+            version_counter: AtomicU64::new(0)
         }
     }
 
@@ -60,8 +91,12 @@ impl Art {
         self.len() == 0
     }
 
-    pub fn insert(&mut self, key: &[u8], mut value: TwigNode) -> Option<TwigNode> {
-        let (parent_opt, cursor) = self.slot_for_key(&key, true).unwrap();
+    pub fn root_as_ref(&self) -> &NodePtr {
+        &self.root
+    }
+
+    pub fn insert(&mut self, key: &[u8], mut value: serde_json::Value, ts: u64) -> Result<DocPtr> {
+        let (parent_opt, cursor) = self.slot_for_key(&key, true, ts).unwrap();
         match cursor.deref_mut() {
             NodeMut::Value(ref mut old) => {
                 std::mem::swap(&mut **old, &mut value);
@@ -145,14 +180,17 @@ impl Art {
         &mut self,
         key: &[u8],
         is_add: bool,
+        ts: u64,
     ) -> Option<(Option<&mut u16>, &mut NodePtr)> {
         let mut parent: Option<&mut u16> = None;
         let mut path: &[u8] = &key[..];
         let mut cursor: &mut NodePtr = &mut self.root;
-        // println!("root is {:?}", cursor);
+        #[cfg(test)]
+        println!("root is {:?}", cursor);
 
         while !path.is_empty() {
-            //println!("path: {:?} cursor {:?}", path, cursor);
+            #[cfg(test)]
+            println!("path: {:?} cursor {:?}", path, cursor);
             cursor.assert_size();
             if cursor.is_none() {
                 if !is_add {
@@ -184,16 +222,19 @@ impl Art {
                 // path compression needs to be reduced
                 // to allow for this key, which does not
                 // share the compressed path.
-                // println!("truncating cursor at {:?}", cursor);
+                #[cfg(test)]
+                println!("truncating cursor at {:?}", cursor);
                 cursor.truncate_prefix(partial_path);
-                // println!("cursor is now after truncation {:?}", cursor);
+                #[cfg(test)]
+                println!("cursor is now after truncation {:?}", cursor);
                 continue;
             }
 
             let next_byte = path[prefix.len()];
             path = &path[prefix.len() + 1..];
 
-            //println!("cursor is now {:?}", cursor);
+            #[cfg(test)]
+            println!("cursor is now {:?}", cursor);
             let clear_child_index = !is_add && path.is_empty();
             let (p, next_cursor) =
                 if let Some(opt) = cursor.child_mut(next_byte, is_add, clear_child_index) {
@@ -232,11 +273,6 @@ enum NodeMut<'a> {
 
 #[derive(Debug)]
 struct NodePtr(usize);
-
-struct NodeIter<'a> {
-    node: &'a NodePtr,
-    children: Box<dyn 'a + DoubleEndedIterator<Item = (Option<u8>, &'a NodePtr)>>,
-}
 
 impl NodePtr {
     const fn none() -> NodePtr {
@@ -507,9 +543,15 @@ impl NodePtr {
     }
 
     fn truncate_prefix(&mut self, partial_path: &[u8]) {
-        // println!("truncating prefix");
+        #[cfg(test)]
+        println!("truncating prefix");
         // expand path at shared prefix
-        //println!("chopping off a prefix at node {:?} since our partial path is {:?}", cursor.header(), partial_path);
+        #[cfg(test)]
+        println!(
+            "chopping off a prefix at node {:?} since our partial path is {:?}",
+            self.header(),
+            partial_path
+        );
         let prefix = self.prefix();
 
         let shared_bytes = partial_path
@@ -518,7 +560,12 @@ impl NodePtr {
             .take_while(|(a, b)| a == b)
             .count();
 
-        // println!("truncated node has path of len {} with a reduction of {}", shared_bytes, prefix.len() - shared_bytes);
+        #[cfg(test)]
+        println!(
+            "truncated node has path of len {} with a reduction of {}",
+            shared_bytes,
+            prefix.len() - shared_bytes
+        );
         let mut new_node4: Box<Node4> = Box::default();
         new_node4.header.path[..shared_bytes].copy_from_slice(&prefix[..shared_bytes]);
         new_node4.header.path_len = u8::try_from(shared_bytes).unwrap();
@@ -599,6 +646,26 @@ impl NodePtr {
         *self.header_mut() = old_header;
     }
 
+    fn node_iter<'a>(&'a self) -> NodeIter<'a> {
+        let children: Box<dyn 'a + DoubleEndedIterator<Item = (Option<u8>, &'a NodePtr)>> =
+            match self.deref() {
+                NodeRef::Node1(n1) => Box::new(n1.iter()),
+                NodeRef::Node4(n4) => Box::new(n4.iter()),
+                NodeRef::Node16(n16) => Box::new(n16.iter()),
+                NodeRef::Node48(n48) => Box::new(n48.iter()),
+                NodeRef::Node256(n256) => Box::new(n256.iter()),
+
+                // this is only an iterator over nodes, not leaf values
+                NodeRef::None => Box::new([].into_iter()),
+                NodeRef::Value(_) => Box::new([].into_iter()),
+            };
+
+        NodeIter {
+            node: self,
+            children,
+        }
+    }
+
     fn child_mut(
         &mut self,
         byte: u8,
@@ -624,26 +691,6 @@ impl NodePtr {
             NodeMut::None => unreachable!(),
             NodeMut::Value(_) => unreachable!(),
         })
-    }
-
-    fn node_iter<'a>(&'a self) -> NodeIter<'a> {
-        let children: Box<dyn 'a + DoubleEndedIterator<Item = (Option<u8>, &'a NodePtr)>> =
-            match self.deref() {
-                NodeRef::Node1(n1) => Box::new(n1.iter()),
-                NodeRef::Node4(n4) => Box::new(n4.iter()),
-                NodeRef::Node16(n16) => Box::new(n16.iter()),
-                NodeRef::Node48(n48) => Box::new(n48.iter()),
-                NodeRef::Node256(n256) => Box::new(n256.iter()),
-
-                // this is only an iterator over nodes, not leaf values
-                NodeRef::None => Box::new([].into_iter()),
-                NodeRef::Value(_) => Box::new([].into_iter()),
-            };
-
-        NodeIter {
-            node: self,
-            children,
-        }
     }
 }
 
@@ -704,12 +751,17 @@ impl Clone for NodePtr {
     }
 }
 
-#[derive(Clone, Default, Copy, Debug, PartialEq)]
+struct NodeIter<'a> {
+    node: &'a NodePtr,
+    children: Box<dyn 'a + DoubleEndedIterator<Item = (Option<u8>, &'a NodePtr)>>,
+}
+
+#[derive(Clone, Default, Copy, PartialEq, Debug)]
 struct NodeHeader {
     path: [u8; MAX_PATH_COMPRESSION_BYTES],
     path_len: u8,
     children: u16,
-    ts: u64,
+    version: u64,
 }
 
 #[derive(Clone, Default)]
@@ -1035,6 +1087,7 @@ impl Node48 {
     fn downgrade(&mut self) -> Box<Node16> {
         let mut n16: Box<Node16> = Box::default();
         let mut dst_idx = 0;
+
         for (byte, idx) in self.key_hashes.iter().enumerate() {
             if let Some(i) = idx {
                 assert!(!self.slots[*i as usize].is_none());
@@ -1105,91 +1158,183 @@ impl Node256 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct DocPtr(usize);
+
+#[derive(Debug, Clone, PartialEq)]
+struct LeafNode {
+    version: u64,
+    doc: DocPtr,
+    ts: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+enum TwigKey {
+    Null,
+    Bool(bool),
+    String(Vec<u8>),
+    Unsigned(u64),
+    Signed(i64),
+    Float(f64),
+}
+
+impl From<&serde_json::Value> for TwigKey {
+    fn from(value: &serde_json::Value) -> Self {
+        match value {
+            Value::Null => TwigKey::Null,
+            Value::Bool(b) => TwigKey::Bool(*b),
+            Value::String(s) => TwigKey::String(storekey::encode::serialize(s).expect("Encoding should always be valid.")),
+            Value::Number(n) => {
+                if n.is_f64() {
+                    TwigKey::Float(n.as_f64().expect("Float point casting should always work."))
+                } else if n.is_i64() {
+                    TwigKey::Signed(n.as_i64().expect("Signed integer casting should always work"))
+                } else {
+                    TwigKey::Unsigned(n.as_u64().expect("Unsigned integer casting should always work"))
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[repr(align(8))]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 struct TwigNode {
     header: NodeHeader,
-    doc: String,
+    aggregates: Vec<Option<(u16, u16)>>,
+    keys: Vec<TwigKey>,
+    leafs: Vec<LeafNode>,
 }
 
 impl TwigNode {
-    fn new(header: NodeHeader, doc: String) -> Self {
-        TwigNode { header, doc }
+    fn new(header: NodeHeader, key: Value, leaf: LeafNode) -> Self {
+        TwigNode {
+            header,
+            aggregates: [],
+            keys: vec![TwigKey::from(&key)],
+            leafs: vec![leaf],
+        }
+    }
+
+    fn checked_add(&mut self, key: Value, leaf: LeafNode) -> Result<()> {
+        let attempt_key = TwigKey::from(&key);
+        let cur_key = self
+            .keys
+            .first()
+            .expect("There should always exist at least one entry in the twig key vec.");
+        if !(std::mem::discriminant(&attempt_key) == std::mem::discriminant(cur_key)) {
+            return Err(Error::ConflictingTwigTypes {
+                origin: cur_key.clone(),
+                added: attempt_key,
+            });
+        }
+        // TODO:
+        // Update the aggregations here depending on the key variant.
+        self.update_aggregates(&attempt_key)?;
+        self.keys.push(attempt_key);
+        self.leafs.push(leaf);
+        Ok(())
+    }
+
+    fn force_add(&mut self, key: Value, leaf: LeafNode) {
+        todo!()
+    }
+
+    fn update_aggregates(&mut self, entry: &TwigKey) -> Result<()> {
+        todo!()
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::art::NONE_HEADER;
-
     use super::{Art, NodeHeader, TwigNode};
 
     #[test]
     fn basic() {
         let mut art = Art::new();
-        art.insert(&[37], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[0], TwigNode::new(NONE_HEADER, String::from("Test2")));
-        assert_eq!(art.len(), 2);
+        art.insert(
+            &vec![5, 2, 3, 0b0],
+            TwigNode::new(NodeHeader::default(), String::from("T1")),
+        );
 
-        art.insert(&[5], TwigNode::new(NONE_HEADER, String::from("Test5")));
-        art.insert(&[1], TwigNode::new(NONE_HEADER, String::from("Test1")));
-        art.insert(&[0], TwigNode::new(NONE_HEADER, String::from("Test0")));
-        art.insert(&[255], TwigNode::new(NONE_HEADER, String::from("Test255")));
-        art.insert(&[0], TwigNode::new(NONE_HEADER, String::from("Test0")));
-        art.insert(&[47], TwigNode::new(NONE_HEADER, String::from("Test47")));
-        art.insert(&[253], TwigNode::new(NONE_HEADER, String::from("Test253")));
-        assert_eq!(art.len(), 7);
+        art.insert(
+            &vec![7, 21, 4, 0b0],
+            TwigNode::new(NodeHeader::default(), String::from("T2")),
+        );
 
-        art.insert(&[10], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[38], TwigNode::new(NONE_HEADER, String::from("Test2")));
-        art.insert(&[24], TwigNode::new(NONE_HEADER, String::from("Test72")));
-        assert_eq!(art.len(), 10);
-        art.insert(&[28], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[30], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[28], TwigNode::new(NONE_HEADER, String::from("Test44")));
-        art.insert(&[51], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[53], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[59], TwigNode::new(NONE_HEADER, String::from("Test")));
-        art.insert(&[58], TwigNode::new(NONE_HEADER, String::from("Test")));
-        assert_eq!(art.len(), 16);
-        /* art.insert([28], 30);
-        art.insert([30], 30);
-        art.insert([28], 15);
-        art.insert([51], 48);
-        art.insert([53], 255);
-        art.insert([59], 58);
-        art.insert([58], 58);
-        assert_eq!(art.len(), 16);
-        assert_eq!(art.remove(&[85]), None);
-        assert_eq!(art.len(), 16); */
+        art.insert(
+            &vec![5, 2, 0b0],
+            TwigNode::new(NodeHeader::default(), String::from("T3")),
+        );
+
+        art.insert(
+            &vec![5, 2, 3, 25, 0b0],
+            TwigNode::new(NodeHeader::default(), String::from("T4")),
+        );
+
+        assert_eq!(art.len(), 4);
+
+        art.insert(
+            &vec![2, 255, 0b0],
+            TwigNode::new(NodeHeader::default(), String::from("T5")),
+        );
+
+        art.insert(
+            &vec![0],
+            TwigNode::new(NodeHeader::default(), String::from("T0")),
+        );
+
+        assert_eq!(art.len(), 6);
+
+        art.insert(
+            &vec![2, 255, 0b0],
+            TwigNode::new(NodeHeader::default(), String::from("T5")),
+        );
+
+        art.insert(
+            &vec![0],
+            TwigNode::new(NodeHeader::default(), String::from("T0")),
+        );
+
+        assert_eq!(art.len(), 6);
     }
 
     #[test]
-    fn regression_04() {
-        let mut art = Art::new();
-
-        art.insert(&[], TwigNode::new(NONE_HEADER, String::from("Test")));
+    fn regression_01() {
+        let mut art: Art = Art::new();
 
         assert_eq!(
-            art.get(&[]),
-            Some(&TwigNode::new(NONE_HEADER, String::from("Test")))
+            art.insert(
+                &[0, 0, 0],
+                TwigNode::new(NodeHeader::default(), String::from("Test"))
+            ),
+            None
         );
         assert_eq!(
-            art.remove(&[]),
-            Some(TwigNode::new(NONE_HEADER, String::from("Test")))
+            art.insert(
+                &[0, 11, 0],
+                TwigNode::new(NodeHeader::default(), String::from("Test"))
+            ),
+            None
         );
-        assert_eq!(art.get(&[]), None);
-    }
+        assert_eq!(
+            art.insert(
+                &[0, 0, 0],
+                TwigNode::new(NodeHeader::default(), String::from("Test"))
+            ),
+            Some(TwigNode::new(NodeHeader::default(), String::from("Test")))
+        );
 
-    #[test]
-    fn regression_05() {
-        let mut art = Art::new();
+        let it = art.root_as_ref().node_iter();
+        for n in it.children {
+            println!("test: {:?}", n);
+        }
 
-        let k = [0; 2];
-        //art.insert(k, 0);
-        //assert_eq!(art.remove(&k), Some(0));
-
-        assert!(art.root.is_none());
+        /*         assert_eq!(
+            art.iter().collect::<Vec<_>>(),
+            vec![([0, 0, 0], &2), ([0, 11, 0], &1),]
+        ); */
     }
 }
 

@@ -1,0 +1,45 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'persistent-art-toy'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=persistent-art-toy",
+                    "--package=persistent-art-toy"
+                ],
+                "filter": {
+                    "name": "persistent-art-toy",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'persistent-art-toy'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=persistent-art-toy",
+                    "--package=persistent-art-toy"
+                ],
+                "filter": {
+                    "name": "persistent-art-toy",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
