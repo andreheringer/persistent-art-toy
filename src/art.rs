@@ -1106,6 +1106,23 @@ impl Node48 {
 #[derive(Clone)]
 struct Node256 {
     header: NodeHeader,
+    /* 
+    TODO:
+    Add aggregates in the inner nodes instead.
+    Should yield more predictable behavior.
+    Something along the lines:
+
+    Rust:    
+        ``aggregates: [SegmentArrayPtr, 256]``
+
+    Where `SegmentArrayPtr` is a pointer to a new data structure,
+    which should be used as a Segment Tree for the following metrics:
+    `avg(), count(), max(), min(), sum(), group_concat()`
+    respecting the types that make sense for each metric (of course).
+
+    Segments should be of a deterministic size: 0-255, 256-511, 512-1023, 1024-2047
+    
+    */  
     slots: [NodePtr; 256],
 }
 
@@ -1202,7 +1219,6 @@ impl From<&serde_json::Value> for TwigKey {
 #[derive(Clone, PartialEq, Debug)]
 struct TwigNode {
     header: NodeHeader,
-    aggregates: Vec<Option<(u16, u16)>>,
     keys: Vec<TwigKey>,
     leafs: Vec<LeafNode>,
 }
@@ -1211,7 +1227,6 @@ impl TwigNode {
     fn new(header: NodeHeader, key: Value, leaf: LeafNode) -> Self {
         TwigNode {
             header,
-            aggregates: [],
             keys: vec![TwigKey::from(&key)],
             leafs: vec![leaf],
         }
