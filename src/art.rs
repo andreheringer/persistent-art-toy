@@ -1,7 +1,14 @@
-use std::{collections::{BTreeMap, HashMap}, f32::consts::E, mem::size_of, sync::atomic::AtomicU64};
+use std::{
+    collections::{BTreeMap, HashMap},
+    f32::consts::E,
+    mem::size_of,
+    sync::atomic::AtomicU64,
+};
 
 use derive_more::derive::From;
-use serde_json::{Number, Value};
+use serde_json::Value;
+
+const ART_BLOCK_SIZE: usize = 256;
 
 const TAG_NONE: usize = 0b000;
 const TAG_VALUE: usize = 0b001;
@@ -12,6 +19,9 @@ const TAG_48: usize = 0b101;
 const TAG_256: usize = 0b110;
 const TAG_MASK: usize = 0b111;
 const PTR_MASK: usize = usize::MAX - TAG_MASK;
+
+const HEAP_TAG_DISK: usize = 0b0;
+const HEAP_TAG_MEM: usize = 0b1;
 
 const MAX_PATH_COMPRESSION_BYTES: usize = 9;
 
@@ -48,7 +58,8 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub struct Art {
     len: usize,
     root: NodePtr,
-    version_counter: AtomicU64,
+    version_counter: u64,
+    allocated_blocks: usize,
 }
 
 impl Clone for Art {
@@ -56,10 +67,8 @@ impl Clone for Art {
         Self {
             len: self.len.clone(),
             root: self.root.clone(),
-            version_counter: AtomicU64::new(
-                self.version_counter
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            ),
+            version_counter: self.version_counter,
+            allocated_blocks: self.allocated_blocks,
         }
     }
 }
@@ -69,7 +78,8 @@ impl Default for Art {
         Art {
             len: 0,
             root: NodePtr::none(),
-            version_counter: AtomicU64::new(0)
+            version_counter: 0,
+            allocated_blocks: 1,
         }
     }
 }
@@ -79,7 +89,8 @@ impl Art {
         Art {
             len: 0,
             root: NodePtr::none(),
-            version_counter: AtomicU64::new(0)
+            version_counter: 0,
+            allocated_blocks: 1,
         }
     }
 
@@ -95,12 +106,15 @@ impl Art {
         &self.root
     }
 
-    pub fn insert(&mut self, key: &[u8], mut value: serde_json::Value, ts: u64) -> Result<DocPtr> {
+    pub fn insert(&mut self, key: &[u8], mut value: serde_json::Value, ts: u64) -> Result<HeapPtr> {
         let (parent_opt, cursor) = self.slot_for_key(&key, true, ts).unwrap();
         match cursor.deref_mut() {
-            NodeMut::Value(ref mut old) => {
-                std::mem::swap(&mut **old, &mut value);
-                Some(value)
+            NodeMut::Value(ref mut twig) => {
+                twig.header.version += 1;
+                twig.checked_add(
+                    LeafNode::new(twig.header.version, HeapPtr(ts as uszies), ts),
+                    value,
+                )
             }
             NodeMut::None => {
                 *cursor = NodePtr::value(value);
@@ -1106,13 +1120,13 @@ impl Node48 {
 #[derive(Clone)]
 struct Node256 {
     header: NodeHeader,
-    /* 
+    /*
     TODO:
     Add aggregates in the inner nodes instead.
     Should yield more predictable behavior.
     Something along the lines:
 
-    Rust:    
+    Rust:
         ``aggregates: [SegmentArrayPtr, 256]``
 
     Where `SegmentArrayPtr` is a pointer to a new data structure,
@@ -1121,8 +1135,8 @@ struct Node256 {
     respecting the types that make sense for each metric (of course).
 
     Segments should be of a deterministic size: 0-255, 256-511, 512-1023, 1024-2047
-    
-    */  
+
+    */
     slots: [NodePtr; 256],
 }
 
@@ -1176,38 +1190,76 @@ impl Node256 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct DocPtr(usize);
+struct HeapPtr(usize);
+
+impl HeapPtr {
+    fn disk_ptr(disk: Box<HeapDiskPtr>) -> HeapPtr {
+        let ptr: *mut HeapDiskPtr = Box::into_raw(disk);
+        let us = ptr as usize;
+        assert_eq!(us & HEAP_TAG_DISK, 0);
+        HeapPtr(us | HEAP_TAG_DISK)
+    }
+}
+
+struct HeapPage {
+    page_header: u64,
+    payload: [u8; 4000],
+    next_payload: Option<HeapPtr>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct HeapDiskPtr {
+    block_offset: u64,
+    byte_offset: u64,
+}
+
+impl HeapDiskPtr {}
+
+enum HeapRef<'page> {
+    Mem(&'page HeapPage),
+    Disk(&'page HeapDiskPtr),
+}
+
+enum HeapMut<'page> {
+    Mem(&'page mut HeapPage),
+    Disk(&'page mut HeapDiskPtr),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct LeafNode {
     version: u64,
-    doc: DocPtr,
+    doc: HeapPtr,
     ts: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
+impl LeafNode {
+    pub fn new(version: u64, doc: HeapPtr, ts: u64) -> LeafNode {
+        LeafNode { version, doc, ts }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, PartialOrd, Copy)]
 enum TwigKey {
+    // This should implement all SQL types, since they should be
+    // the way you determine a collumns type.
     Null,
-    Bool(bool),
-    String(Vec<u8>),
-    Unsigned(u64),
-    Signed(i64),
-    Float(f64),
+    Bool,
+    String,
+    Integer,
+    Float,
 }
 
 impl From<&serde_json::Value> for TwigKey {
     fn from(value: &serde_json::Value) -> Self {
         match value {
             Value::Null => TwigKey::Null,
-            Value::Bool(b) => TwigKey::Bool(*b),
-            Value::String(s) => TwigKey::String(storekey::encode::serialize(s).expect("Encoding should always be valid.")),
+            Value::Bool(_) => TwigKey::Bool,
+            Value::String(_) => TwigKey::String,
             Value::Number(n) => {
                 if n.is_f64() {
-                    TwigKey::Float(n.as_f64().expect("Float point casting should always work."))
-                } else if n.is_i64() {
-                    TwigKey::Signed(n.as_i64().expect("Signed integer casting should always work"))
+                    TwigKey::Float
                 } else {
-                    TwigKey::Unsigned(n.as_u64().expect("Unsigned integer casting should always work"))
+                    TwigKey::Integer
                 }
             }
             _ => unreachable!(),
@@ -1217,49 +1269,51 @@ impl From<&serde_json::Value> for TwigKey {
 
 #[repr(align(8))]
 #[derive(Clone, PartialEq, Debug)]
-struct TwigNode {
+pub struct TwigNode {
     header: NodeHeader,
-    keys: Vec<TwigKey>,
-    leafs: Vec<LeafNode>,
+    key_type: TwigKey,
+    leafs: [Option<LeafNode>; 256],
+    n_leafs: u8,
 }
 
 impl TwigNode {
-    fn new(header: NodeHeader, key: Value, leaf: LeafNode) -> Self {
-        TwigNode {
+    fn new(header: NodeHeader, leaf: LeafNode, key: Value) -> Self {
+        let mut new = TwigNode {
             header,
-            keys: vec![TwigKey::from(&key)],
-            leafs: vec![leaf],
-        }
+            key_type: TwigKey::from(&key),
+            leafs: std::array::from_fn(|_| Option::None),
+            n_leafs: 255u8,
+        };
+        new.leafs[0] = Some(leaf);
+        new
     }
 
-    fn checked_add(&mut self, key: Value, leaf: LeafNode) -> Result<()> {
-        let attempt_key = TwigKey::from(&key);
-        let cur_key = self
-            .keys
-            .first()
-            .expect("There should always exist at least one entry in the twig key vec.");
-        if !(std::mem::discriminant(&attempt_key) == std::mem::discriminant(cur_key)) {
+    fn checked_add(&mut self, leaf: LeafNode, key: Value) -> Result<Option<LeafNode>> {
+        // Leafs are organized in a way that most recent
+        // entries should be accessed first.
+        //
+        // The idea is: when searching all most recent results
+        // should be found first.
+        if std::mem::discriminant(&self.key_type) != std::mem::discriminant(&TwigKey::from(&key)) {
             return Err(Error::ConflictingTwigTypes {
-                origin: cur_key.clone(),
-                added: attempt_key,
+                origin: self.key_type,
+                added: TwigKey::from(&key),
             });
         }
-        // TODO:
-        // Update the aggregations here depending on the key variant.
-        self.update_aggregates(&attempt_key)?;
-        self.keys.push(attempt_key);
-        self.leafs.push(leaf);
-        Ok(())
+        self.n_leafs -= 1;
+        let mut old: Option<LeafNode> = None;
+        if self.n_leafs > 0 {
+            old = std::mem::replace(&mut self.leafs[self.n_leafs as usize], Some(leaf));
+        }
+        Ok(old)
     }
 
     fn force_add(&mut self, key: Value, leaf: LeafNode) {
         todo!()
     }
-
-    fn update_aggregates(&mut self, entry: &TwigKey) -> Result<()> {
-        todo!()
-    }
 }
+
+/*
 
 #[cfg(test)]
 mod test {
@@ -1352,6 +1406,7 @@ mod test {
         ); */
     }
 }
+*/
 
 //#[test]
 /* fn regression_00() {
